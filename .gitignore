@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+
+# Chrome WebDriver
+chromedriver*
+
+# IDE
+.vscode/
+.idea/
+
+# Output files
+*.xlsx
+!requirements.txt
