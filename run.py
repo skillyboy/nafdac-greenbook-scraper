@@ -8,6 +8,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException, NoAlertPresentException, StaleElementReferenceException, InvalidSessionIdException
 import csv
 import traceback
+import requests
 from webdriver_manager.chrome import ChromeDriverManager
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -144,6 +145,91 @@ def load_existing_data(output_file):
         print(f"No existing data found or error loading file: {e}")
         return [], 1
 
+
+def detect_datatables_ajax(driver):
+    """Return the DataTables ajax URL (string) and info dict if the table is serverSide, else (None, None)."""
+    try:
+        js = ("return (function(){"
+              "var tbl = document.querySelector('table.dataTable');"
+              "if(!tbl) return null;"
+              "var dt=null;"
+              "try{ dt = window.jQuery && jQuery(tbl).DataTable ? jQuery(tbl).DataTable() : null; }catch(e){ dt=null; }"
+              "if(!dt){ try{ dt = $.fn.dataTable.Api(tbl); }catch(e){ dt=null; } }"
+              "if(!dt) return null;"
+              "var settings = null; try{ settings = dt.page.info ? dt.page.info() : (dt.settings ? dt.settings()[0] : null);}catch(e){ settings=null;}"
+              "var ajax = null; try{ ajax = dt.ajax ? dt.ajax : (dt.settings && dt.settings()[0] && dt.settings()[0].oFeatures ? dt.settings()[0].ajax : null);}catch(e){ ajax=null;}"
+              "if(ajax && typeof ajax === 'object' && ajax.url) return {ajax: ajax.url, info: settings};"
+              "if(ajax && typeof ajax === 'string') return {ajax: ajax, info: settings};"
+              "return {ajax:null, info:settings}; })();")
+        res = driver.execute_script(js)
+        if not res:
+            return None, None
+        ajax = res.get('ajax') if isinstance(res, dict) else None
+        info = res.get('info') if isinstance(res, dict) else None
+        return ajax, info
+    except Exception as e:
+        print(f"detect_datatables_ajax error: {e}")
+        return None, None
+
+
+def api_scrape(ajax_url, start_page, end_page, csv_checkpoint, cookies=None, headers=None, page_length=10):
+    """Scrape pages via the DataTables server-side AJAX endpoint and append rows to CSV checkpoint.
+    Returns total rows scraped.
+    """
+    s = requests.Session()
+    if headers:
+        s.headers.update(headers)
+    if cookies:
+        for c in cookies:
+            s.cookies.set(c['name'], c.get('value',''))
+
+    total_rows = 0
+    for page in range(start_page, end_page + 1):
+        start = (page - 1) * page_length
+        params = {
+            'start': start,
+            'length': page_length,
+            'draw': page
+        }
+        try:
+            resp = s.get(ajax_url, params=params, timeout=30)
+            resp.raise_for_status()
+            j = resp.json()
+            data = None
+            if isinstance(j, dict):
+                data = j.get('data') or j.get('aaData')
+            elif isinstance(j, list):
+                data = j
+            if not data:
+                print(f"No data returned for page {page} (status {resp.status_code})")
+                break
+
+            # Normalize rows: if rows are dicts, take values; if lists, use directly
+            page_rows = []
+            for row in data:
+                if isinstance(row, dict):
+                    # preserve order by keys if possible, else values()
+                    vals = list(row.values())
+                    page_rows.append(vals)
+                elif isinstance(row, (list, tuple)):
+                    page_rows.append(list(row))
+                else:
+                    page_rows.append([str(row)])
+
+            append_rows_to_csv(page_rows, csv_checkpoint)
+            total_rows += len(page_rows)
+            print(f"API scraped page {page}: {len(page_rows)} rows (total {total_rows})")
+
+            # If fewer than page_length returned, probably last page
+            if len(page_rows) < page_length:
+                break
+
+        except Exception as e:
+            print(f"API scraping error on page {page}: {e}")
+            break
+
+    return total_rows
+
 def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=True, driver_path=None, start_page=None, no_headless=False, debug=False):
     # Setup Chrome options
     options = webdriver.ChromeOptions()
@@ -203,6 +289,23 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
                 print("--- END DEBUG ---")
             except Exception as e:
                 print(f"Debug dump failed: {e}")
+
+        # Detect if DataTables is server-side and has an AJAX endpoint. If so, prefer API scraping.
+        try:
+            ajax_url, dt_info = detect_datatables_ajax(driver)
+            if ajax_url and dt_info and dt_info.get('serverSide'):
+                print(f"Detected DataTables server-side ajax: {ajax_url} (info: {dt_info})")
+                # Prepare headers/cookies for requests
+                headers = {'User-Agent': 'Mozilla/5.0', 'Referer': driver.current_url}
+                cookies = driver.get_cookies()
+                csv_checkpoint = os.path.splitext(output_file)[0] + ".csv"
+                scraped = api_scrape(ajax_url, page, end_page, csv_checkpoint, cookies=cookies, headers=headers, page_length=dt_info.get('length',10))
+                print(f"API-mode scraping finished, {scraped} rows appended to {csv_checkpoint}")
+                # Close the browser and exit early since we've completed via API
+                driver.quit()
+                return
+        except Exception as e:
+            print(f"API detection/scrape skipped due to error: {e}")
         
         # Load existing data and determine start page
         data, last_page = load_existing_data(output_file)
