@@ -144,10 +144,11 @@ def load_existing_data(output_file):
         print(f"No existing data found or error loading file: {e}")
         return [], 1
 
-def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=True, driver_path=None, start_page=None):
+def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=True, driver_path=None, start_page=None, no_headless=False, debug=False):
     # Setup Chrome options
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
+    if not no_headless:
+        options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")  # Larger window for better rendering
@@ -181,6 +182,27 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
         print("Waiting for table to appear...")
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.dataTable")))
         time.sleep(2)  # Allow table to fully render
+
+        # If debug mode is on, dump DataTables info to help debugging JS API issues
+        if debug:
+            try:
+                print("--- DEBUG: DataTables inspection ---")
+                js = ("return (function(){"
+                      "var res=[];"
+                      "var tables = document.querySelectorAll('table.dataTable');"
+                      "for (var i=0;i<tables.length;i++){"
+                      " var tbl = tables[i];"
+                      " var info={};"
+                      " info.index=i; info.id=tbl.id||null;"
+                      " try{ info.html = tbl.outerHTML.substring(0,500); }catch(e){ info.html='err'; }"
+                      " try{ if(window.jQuery && jQuery(tbl).DataTable) var dt = jQuery(tbl).DataTable(); else if(window.jQuery && jQuery.fn && jQuery.fn.dataTable && jQuery.fn.dataTable.Api) var dt = new jQuery.fn.dataTable.Api(tbl); else var dt = null;}catch(e){ dt=null; info.dt_err = e.toString(); }"
+                      " if(dt){ try{ info.page = dt.page(); }catch(e){ info.page='err'; } try{ info.info = dt.page.info(); }catch(e){ info.info='err'; } } else { info.dt='no-dt'; }"
+                      " res.push(info); } return res; })();")
+                dt_info = driver.execute_script(js)
+                print(dt_info)
+                print("--- END DEBUG ---")
+            except Exception as e:
+                print(f"Debug dump failed: {e}")
         
         # Load existing data and determine start page
         data, last_page = load_existing_data(output_file)
@@ -689,7 +711,9 @@ if __name__ == "__main__":
     parser.add_argument("--end", type=int, default=876, help="End page")
     parser.add_argument("--driver", type=str, help="Full path to chromedriver executable to avoid auto-download")
     parser.add_argument("--file", type=str, default="nafdac_greenbook.xlsx", help="Output Excel file path")
+    parser.add_argument("--no-headless", action="store_true", help="Run Chrome with visible UI for debugging")
+    parser.add_argument("--debug", action="store_true", help="Enable debug JS dumps to stdout")
     args = parser.parse_args()
 
     # If user provided a start page, pass it through to scrape_greenbook
-    scrape_greenbook(output_file=args.file, end_page=args.end, resume=True, driver_path=args.driver, start_page=args.start)
+    scrape_greenbook(output_file=args.file, end_page=args.end, resume=True, driver_path=args.driver, start_page=args.start, no_headless=args.no_headless, debug=args.debug)
