@@ -5,7 +5,9 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException, NoAlertPresentException, StaleElementReferenceException
+from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException, NoAlertPresentException, StaleElementReferenceException, InvalidSessionIdException
+import csv
+import traceback
 from webdriver_manager.chrome import ChromeDriverManager
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -91,16 +93,49 @@ def save_to_excel(data, output_file):
             else:
                 raise Exception("Could not save file in any location")
 
+
+def append_rows_to_csv(rows, csv_path):
+    """Append rows (list of lists) to a CSV file. Creates file with header if missing."""
+    if not rows:
+        return
+    header = [
+        "Product Name", "Active Ingredient", "Dosage Form",
+        "Product Category", "NAFDAC Reg No", "Applicant",
+        "Manufacturer", "Approval Date"
+    ]
+    exists = os.path.exists(csv_path)
+    with open(csv_path, "a", newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        if not exists:
+            writer.writerow(header)
+        for r in rows:
+            writer.writerow(r)
+
 def load_existing_data(output_file):
+    # Prefer CSV checkpoint if available for faster/resilient resume
+    csv_file = os.path.splitext(output_file)[0] + ".csv"
+    data = []
     try:
+        if os.path.exists(csv_file):
+            with open(csv_file, newline='', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                # skip header
+                headers = next(reader, None)
+                for row in reader:
+                    if any(cell.strip() for cell in row if isinstance(cell, str)):
+                        data.append(row)
+            last_page = (len(data) // 10) + 1 if data else 1
+            print(f"Loaded {len(data)} existing records from CSV (approximately page {last_page})")
+            return data, last_page
+
+        # Fallback to Excel load if CSV missing
         from openpyxl import load_workbook
         wb = load_workbook(output_file)
         ws = wb.active
-        data = []
         for row in ws.iter_rows(min_row=2, values_only=True):  # Skip header row
             if any(cell is not None for cell in row):  # Only include non-empty rows
                 data.append(list(row))
-        
+
         # Calculate the page number based on records (10 records per page)
         last_page = (len(data) // 10) + 1 if data else 1
         print(f"Loaded {len(data)} existing records (approximately page {last_page})")
@@ -117,13 +152,24 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")  # Larger window for better rendering
     
+    def init_driver():
+        """Initialize and return a Chrome webdriver instance (retries on failures)."""
+        last_err = None
+        for attempt in range(3):
+            try:
+                if driver_path:
+                    d = webdriver.Chrome(service=Service(driver_path), options=options)
+                else:
+                    d = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+                return d
+            except Exception as e:
+                last_err = e
+                print(f"Driver init failed (attempt {attempt+1}/3): {e}")
+                time.sleep(2)
+        raise Exception(f"Could not initialize Chrome driver: {last_err}")
+
     # Initialize driver
-    if driver_path:
-        # Use provided ChromeDriver binary
-        driver = webdriver.Chrome(service=Service(driver_path), options=options)
-    else:
-        # Fallback to webdriver_manager (may query OS for browser version)
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    driver = init_driver()
     
     try:
         # Load the page
@@ -209,6 +255,9 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
                         except:
                             pass
                         time.sleep(1)
+                    except InvalidSessionIdException:
+                        # Driver lost session — propagate so caller can re-init
+                        raise
                     except Exception as e:
                         print(f"go_to_page attempt error: {e}")
                         time.sleep(1)
@@ -319,8 +368,27 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
                             break
                             
                     except:
-                        print("Failed to recover, stopping script")
-                        return
+                        # If session invalid, try to restart driver and return to the last known page
+                        err = traceback.format_exc()
+                        print(f"Failed to recover: {err}")
+                        print("Attempting to restart the browser and resume from current target page...")
+                        try:
+                            try:
+                                driver.quit()
+                            except:
+                                pass
+                            driver = init_driver()
+                            driver.get("https://greenbook.nafdac.gov.ng/")
+                            wait = WebDriverWait(driver, 20)
+                            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.dataTable")))
+                            time.sleep(2)
+                            # Try jumping to the requested page
+                            if go_to_page(page):
+                                print(f"Resumed at page {page} after driver restart")
+                                continue
+                        except Exception as re:
+                            print(f"Could not restart and resume: {re}")
+                            return
         
         # Per-page failure tracking so we can skip problematic pages
         page_failures = {}
@@ -344,19 +412,50 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
                         continue
 
                 # Add to main data list
+                # Add to main data list
                 data.extend(page_data)
                 print(f"Total records collected: {len(data)}")
 
-                # Save progress every 5 pages
-                if page % 5 == 0:
-                    print(f"Saving checkpoint at page {page}...")
-                    save_to_excel(data, output_file)
+                # Append this page's rows to CSV checkpoint (fast and robust)
+                csv_checkpoint = os.path.splitext(output_file)[0] + ".csv"
+                try:
+                    append_rows_to_csv(page_data, csv_checkpoint)
+                except Exception as e:
+                    print(f"Warning: failed to append to CSV checkpoint: {e}")
+
+                # Save Excel checkpoint less frequently (lighter schedule)
+                if page % 50 == 0:
+                    print(f"Saving Excel checkpoint at page {page}...")
+                    try:
+                        save_to_excel(data, output_file)
+                    except Exception as e:
+                        print(f"Warning: failed to save Excel checkpoint: {e}")
 
             except Exception as e:
                 # Record failure for this page and try to recover/skip
                 fail_count = page_failures.get(page, 0) + 1
                 page_failures[page] = fail_count
                 print(f"Error scraping page {page}: {e} (failure {fail_count})")
+
+                # If driver session is invalid, try to restart and resume
+                if isinstance(e, InvalidSessionIdException) or 'invalid session' in str(e).lower():
+                    print("Detected invalid session during page scrape — restarting browser")
+                    try:
+                        try:
+                            driver.quit()
+                        except:
+                            pass
+                        driver = init_driver()
+                        driver.get("https://greenbook.nafdac.gov.ng/")
+                        wait = WebDriverWait(driver, 20)
+                        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.dataTable")))
+                        time.sleep(2)
+                        if go_to_page(page):
+                            print(f"Resumed at page {page} after driver restart")
+                            continue
+                    except Exception as re:
+                        print(f"Failed to restart driver: {re}")
+                        return
 
                 # Accept any alert and try to continue
                 try:
