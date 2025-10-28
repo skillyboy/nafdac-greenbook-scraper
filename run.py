@@ -239,19 +239,41 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
                               "try{ dt.page(%d).draw(false); return 'ok'; }catch(e){ return 'err'; }"
                               "})();") % (target_page - 1)
 
-                        res = driver.execute_script(js)
-                        if res == 'ok':
-                            # Wait a bit for redraw
-                            time.sleep(2)
-                            # Wait until active page number updates
-                            try:
-                                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "li.page-item.active a.page-link")))
-                            except:
-                                pass
-                            return True
-                        else:
+                        # Execute JS and then verify whether the active page becomes target_page.
+                        try:
+                            res = driver.execute_script(js)
+                        except InvalidSessionIdException:
+                            raise
+                        except Exception as e:
+                            res = None
+                            print(f"go_to_page JS exec error: {e}")
+
+                        # Give the table time to redraw
+                        time.sleep(2)
+
+                        # Check active page number explicitly
+                        try:
+                            active_el = driver.find_element(By.CSS_SELECTOR, "li.page-item.active a.page-link")
+                            if active_el and active_el.text.strip().isdigit() and int(active_el.text.strip()) == target_page:
+                                return True
+                        except Exception:
+                            pass
+
+                        # If JS returned a diagnostic string, log it
+                        if isinstance(res, str):
                             print(f"DataTables jump returned: {res}")
-                            return False
+
+                        # One last short wait and re-check
+                        time.sleep(1)
+                        try:
+                            active_el = driver.find_element(By.CSS_SELECTOR, "li.page-item.active a.page-link")
+                            if active_el and active_el.text.strip().isdigit() and int(active_el.text.strip()) == target_page:
+                                return True
+                        except Exception:
+                            pass
+
+                        # Not successful this attempt
+                        print(f"DataTables jump did not move to page {target_page} (JS res={res})")
 
                     except UnexpectedAlertPresentException:
                         try:
@@ -267,6 +289,8 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
                         time.sleep(1)
                 return False
                 
+            # Track repeated failures to make a stronger recovery if pagination gets stuck
+            stuck_attempts = 0
             while current_page < page:
                 try:
                     # Wait for navigation elements to be present
@@ -311,31 +335,101 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
                                     print(f"Clicking page {target} button...")
                                     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
                                     time.sleep(0.5)
-                                    driver.execute_script("arguments[0].click();", btn)
-                                    time.sleep(2)
-                                    handle_alerts()
-                                    
-                                    # Verify the page changed by checking active page number
-                                    try:
-                                        prev = active_page.text
-                                    except:
-                                        prev = None
 
-                                    def page_changed(drv):
+                                    # Try multiple click/dispatch methods. After each attempt, verify the active page.
+                                    clicked = False
+                                    for click_attempt in range(4):
                                         try:
-                                            cur = drv.find_element(By.CSS_SELECTOR, "li.page-item.active a.page-link").text
-                                            return cur != prev
-                                        except:
-                                            return False
+                                            if click_attempt == 0:
+                                                driver.execute_script("arguments[0].click();", btn)
+                                            elif click_attempt == 1:
+                                                driver.execute_script(
+                                                    "var ev = new MouseEvent('click', {bubbles: true, cancelable: true, view: window}); arguments[0].dispatchEvent(ev);",
+                                                    btn)
+                                            elif click_attempt == 2:
+                                                # Try jQuery trigger if available
+                                                try:
+                                                    driver.execute_script("if(window.jQuery){ jQuery(arguments[0]).trigger('click'); }", btn)
+                                                except Exception:
+                                                    pass
+                                            else:
+                                                # Fallback: use DataTables API jump
+                                                try:
+                                                    if go_to_page(target):
+                                                        clicked = True
+                                                        break
+                                                except InvalidSessionIdException:
+                                                    raise
 
-                                    try:
-                                        wait.until(page_changed)
-                                    except:
-                                        # Fallback: wait for table rows to be present
+                                            time.sleep(1.5)
+                                            handle_alerts()
+
+                                            # Verify the page changed
+                                            try:
+                                                cur = driver.find_element(By.CSS_SELECTOR, "li.page-item.active a.page-link").text
+                                                if cur.strip().isdigit() and int(cur) == target:
+                                                    clicked = True
+                                                    break
+                                            except Exception:
+                                                # As a looser fallback, check for presence of rows (table refreshed)
+                                                try:
+                                                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.dataTable tbody tr")))
+                                                except Exception:
+                                                    pass
+
+                                        except InvalidSessionIdException:
+                                            raise
+                                        except Exception as click_err:
+                                            print(f"Click attempt {click_attempt+1} failed: {click_err}")
+                                            handle_alerts()
+                                            time.sleep(1)
+
+                                    if not clicked:
+                                        print(f"Failed to navigate to page {target} via button clicks; trying DataTables API fallback")
+                                        stuck_attempts += 1
+                                        # If we've been stuck clicking the same pages repeatedly, try a stronger recovery
+                                        if stuck_attempts >= 5:
+                                            print("Pagination appears stuck — refreshing and attempting to recover")
+                                            try:
+                                                driver.refresh()
+                                                time.sleep(3)
+                                                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.dataTable")))
+                                                # Try to jump directly to desired page after refresh
+                                                if go_to_page(page):
+                                                    print(f"Recovered and jumped to page {page} after refresh")
+                                                    current_page = page
+                                                    break
+                                            except Exception as re:
+                                                print(f"Refresh recovery failed: {re}")
+                                                # Try full driver restart
+                                                try:
+                                                    try:
+                                                        driver.quit()
+                                                    except:
+                                                        pass
+                                                    driver = init_driver()
+                                                    driver.get("https://greenbook.nafdac.gov.ng/")
+                                                    wait = WebDriverWait(driver, 20)
+                                                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.dataTable")))
+                                                    time.sleep(2)
+                                                    if go_to_page(page):
+                                                        print(f"Recovered and jumped to page {page} after driver restart")
+                                                        current_page = page
+                                                        stuck_attempts = 0
+                                                        break
+                                                except Exception as re2:
+                                                    print(f"Driver restart recovery failed: {re2}")
+                                                    return
                                         try:
-                                            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.dataTable tbody tr")))
-                                        except:
-                                            pass
+                                            if go_to_page(target):
+                                                print(f"Jumped to page {target} using DataTables API fallback")
+                                                current_page = target
+                                                break
+                                        except InvalidSessionIdException:
+                                            raise
+
+                                    if clicked:
+                                        current_page = target
                                     break
                             continue  # Skip the next button click for this iteration
                     
