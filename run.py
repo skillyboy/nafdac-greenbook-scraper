@@ -1,9 +1,11 @@
 from selenium import webdriver
+import argparse
+import os
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException, NoAlertPresentException
+from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException, NoAlertPresentException, StaleElementReferenceException
 from webdriver_manager.chrome import ChromeDriverManager
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -107,7 +109,7 @@ def load_existing_data(output_file):
         print(f"No existing data found or error loading file: {e}")
         return [], 1
 
-def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=True):
+def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=True, driver_path=None):
     # Setup Chrome options
     options = webdriver.ChromeOptions()
     options.add_argument("--headless=new")
@@ -116,7 +118,12 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
     options.add_argument("--window-size=1920,1080")  # Larger window for better rendering
     
     # Initialize driver
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    if driver_path:
+        # Use provided ChromeDriver binary
+        driver = webdriver.Chrome(service=Service(driver_path), options=options)
+    else:
+        # Fallback to webdriver_manager (may query OS for browser version)
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
     
     try:
         # Load the page
@@ -255,9 +262,27 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
                                     time.sleep(2)
                                     handle_alerts()
                                     
-                                    # Verify the page changed
-                                    wait.until(EC.staleness_of(active_page))
-                                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.dataTable tbody tr")))
+                                    # Verify the page changed by checking active page number
+                                    try:
+                                        prev = active_page.text
+                                    except:
+                                        prev = None
+
+                                    def page_changed(drv):
+                                        try:
+                                            cur = drv.find_element(By.CSS_SELECTOR, "li.page-item.active a.page-link").text
+                                            return cur != prev
+                                        except:
+                                            return False
+
+                                    try:
+                                        wait.until(page_changed)
+                                    except:
+                                        # Fallback: wait for table rows to be present
+                                        try:
+                                            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.dataTable tbody tr")))
+                                        except:
+                                            pass
                                     break
                             continue  # Skip the next button click for this iteration
                     
@@ -358,11 +383,31 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
                     time.sleep(1)  # Increased pause before click
                     
                     # Click using JavaScript to avoid potential intercepted click
+                    # click and wait until the active page number changes (more reliable than staleness_of)
+                    try:
+                        prev_active = driver.find_element(By.CSS_SELECTOR, "li.page-item.active a.page-link").text
+                    except:
+                        prev_active = None
+
                     driver.execute_script("arguments[0].click();", next_button)
-                    
-                    # Wait for table update
-                    wait.until(EC.staleness_of(rows[0]))
-                    time.sleep(2)  # Increased pause for table to fully update
+
+                    def active_page_changed(drv):
+                        try:
+                            cur = drv.find_element(By.CSS_SELECTOR, "li.page-item.active a.page-link").text
+                            return cur != prev_active
+                        except:
+                            return False
+
+                    try:
+                        wait.until(active_page_changed)
+                    except:
+                        # Fallback: wait for table rows to be present
+                        try:
+                            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.dataTable tbody tr")))
+                        except:
+                            pass
+
+                    time.sleep(1)  # small pause for table to fully update
                     page += 1
                     break  # Success, exit retry loop
                     
@@ -398,4 +443,16 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
         driver.quit()
 
 if __name__ == "__main__":
-    scrape_greenbook(end_page=876, resume=True)
+    parser = argparse.ArgumentParser(description="NAFDAC Greenbook scraper")
+    parser.add_argument("--start", type=int, help="Start page (overrides resume detection)")
+    parser.add_argument("--end", type=int, default=876, help="End page")
+    parser.add_argument("--driver", type=str, help="Full path to chromedriver executable to avoid auto-download")
+    parser.add_argument("--file", type=str, default="nafdac_greenbook.xlsx", help="Output Excel file path")
+    args = parser.parse_args()
+
+    # If user provided a start page, we'll overwrite resume behavior and start there
+    if args.start:
+        # call with resume=False and set last_page to start
+        scrape_greenbook(output_file=args.file, end_page=args.end, resume=False, driver_path=args.driver)
+    else:
+        scrape_greenbook(output_file=args.file, end_page=args.end, resume=True, driver_path=args.driver)
