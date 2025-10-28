@@ -144,7 +144,7 @@ def load_existing_data(output_file):
         print(f"No existing data found or error loading file: {e}")
         return [], 1
 
-def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=True, driver_path=None):
+def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=True, driver_path=None, start_page=None):
     # Setup Chrome options
     options = webdriver.ChromeOptions()
     options.add_argument("--headless=new")
@@ -184,7 +184,11 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
         
         # Load existing data and determine start page
         data, last_page = load_existing_data(output_file)
-        page = last_page if resume else 1
+        if start_page:
+            page = int(start_page)
+            print(f"Starting from explicit start page {page}")
+        else:
+            page = last_page if resume else 1
         print(f"Starting from page {page}")
         
         # Navigate to start page
@@ -593,9 +597,5 @@ if __name__ == "__main__":
     parser.add_argument("--file", type=str, default="nafdac_greenbook.xlsx", help="Output Excel file path")
     args = parser.parse_args()
 
-    # If user provided a start page, we'll overwrite resume behavior and start there
-    if args.start:
-        # call with resume=False and set last_page to start
-        scrape_greenbook(output_file=args.file, end_page=args.end, resume=False, driver_path=args.driver)
-    else:
-        scrape_greenbook(output_file=args.file, end_page=args.end, resume=True, driver_path=args.driver)
+    # If user provided a start page, pass it through to scrape_greenbook
+    scrape_greenbook(output_file=args.file, end_page=args.end, resume=True, driver_path=args.driver, start_page=args.start)
