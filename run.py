@@ -322,32 +322,76 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
                         print("Failed to recover, stopping script")
                         return
         
+        # Per-page failure tracking so we can skip problematic pages
+        page_failures = {}
+
         while page <= end_page:
             print(f"Scraping page {page}...")
-            
-            # Get rows from current page
-            rows = driver.find_elements(By.CSS_SELECTOR, "table.dataTable tbody tr")
-            print(f"Found {len(rows)} rows on page {page}")
-            
-            # Extract data from rows
-            page_data = []
-            for row in rows:
+            try:
+                # Get rows from current page
+                rows = driver.find_elements(By.CSS_SELECTOR, "table.dataTable tbody tr")
+                print(f"Found {len(rows)} rows on page {page}")
+
+                # Extract data from rows
+                page_data = []
+                for row in rows:
+                    try:
+                        cells = row.find_elements(By.TAG_NAME, "td")
+                        row_data = [cell.text.strip() for cell in cells]
+                        if row_data:
+                            page_data.append(row_data)
+                    except Exception:
+                        continue
+
+                # Add to main data list
+                data.extend(page_data)
+                print(f"Total records collected: {len(data)}")
+
+                # Save progress every 5 pages
+                if page % 5 == 0:
+                    print(f"Saving checkpoint at page {page}...")
+                    save_to_excel(data, output_file)
+
+            except Exception as e:
+                # Record failure for this page and try to recover/skip
+                fail_count = page_failures.get(page, 0) + 1
+                page_failures[page] = fail_count
+                print(f"Error scraping page {page}: {e} (failure {fail_count})")
+
+                # Accept any alert and try to continue
                 try:
-                    cells = row.find_elements(By.TAG_NAME, "td")
-                    row_data = [cell.text.strip() for cell in cells]
-                    if row_data:
-                        page_data.append(row_data)
-                except:
+                    Alert(driver).accept()
+                    print("Accepted alert during page scrape")
+                except Exception:
+                    pass
+
+                # If failures exceed threshold, skip this page
+                if fail_count >= 3:
+                    print(f"Page {page} failing repeatedly — skipping to next page")
+                    # Try to jump to the next page using DataTables API; fallback to clicking next
+                    try:
+                        if go_to_page(page + 1):
+                            page += 1
+                            continue
+                    except Exception:
+                        pass
+
+                    # Try clicking next if available
+                    try:
+                        nb = driver.find_element(By.CSS_SELECTOR, "li.page-item.next:not(.disabled) a")
+                        try:
+                            driver.execute_script("arguments[0].click();", nb)
+                            time.sleep(1)
+                            page += 1
+                            continue
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                    # If all else fails, increment page number (best-effort skip)
+                    page += 1
                     continue
-            
-            # Add to main data list
-            data.extend(page_data)
-            print(f"Total records collected: {len(data)}")
-            
-            # Save progress every 5 pages
-            if page % 5 == 0:
-                print(f"Saving checkpoint at page {page}...")
-                save_to_excel(data, output_file)
             
             # Look for next button
             try:
