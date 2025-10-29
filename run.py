@@ -9,12 +9,45 @@ from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentE
 import csv
 import traceback
 import requests
+from datetime import datetime
 from webdriver_manager.chrome import ChromeDriverManager
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from selenium.webdriver.common.alert import Alert
 import time
+
+# Pre-run convenience: allow setting a start page via environment variable or a small file
+# Priority: CLI --start > START_PAGE env var > start_page.txt file > existing checkpoint detection
+def compute_start_page_from_files(base_name="nafdac_greenbook"):
+    """Return an estimated start page based on existing CSV or Excel checkpoint files.
+    Returns None if no checkpoint is present.
+    """
+    csv_path = base_name + ".csv"
+    xlsx_path = base_name + ".xlsx"
+    try:
+        if os.path.exists(csv_path):
+            with open(csv_path, newline='', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                # skip header
+                next(reader, None)
+                count = sum(1 for _ in reader)
+            return (count // 10) + 1 if count else 1
+        if os.path.exists(xlsx_path):
+            try:
+                from openpyxl import load_workbook
+                wb = load_workbook(xlsx_path, read_only=True)
+                ws = wb.active
+                # subtract header
+                count = 0
+                for _ in ws.iter_rows(min_row=2, values_only=True):
+                    count += 1
+                return (count // 10) + 1 if count else 1
+            except Exception:
+                return None
+    except Exception:
+        return None
+    return None
 
 def save_to_excel(data, output_file):
     import os
@@ -146,6 +179,35 @@ def load_existing_data(output_file):
         return [], 1
 
 
+def log_skipped_page(page, reason, log_path="skipped_pages.log"):
+    try:
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(f"{ts}\tpage:{page}\treason:{reason}\n")
+    except Exception as e:
+        print(f"Failed to write skip log: {e}")
+
+
+def csv_to_excel_stream(csv_path, excel_path):
+    """Convert CSV to XLSX using openpyxl write-only workbook to avoid heavy memory/time cost."""
+    from openpyxl import Workbook
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet(title="NAFDAC Greenbook")
+
+    # Read CSV and write rows directly
+    with open(csv_path, newline='', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        for r in reader:
+            ws.append(r)
+
+    # Ensure parent dir exists
+    try:
+        wb.save(excel_path)
+        print(f"Converted CSV checkpoint to Excel: {excel_path}")
+    except Exception as e:
+        print(f"Failed to write Excel from CSV: {e}")
+
+
 def detect_datatables_ajax(driver):
     """Return the DataTables ajax URL (string) and info dict if the table is serverSide, else (None, None)."""
     try:
@@ -170,6 +232,25 @@ def detect_datatables_ajax(driver):
     except Exception as e:
         print(f"detect_datatables_ajax error: {e}")
         return None, None
+
+
+def detect_ajax_from_html(html, base_url="https://greenbook.nafdac.gov.ng/"):
+    """Try to find a DataTables ajax URL in the HTML (fallback for --force-api).
+    Returns absolute URL or None."""
+    import re
+    # common patterns: "ajax": "URL"  or ajax: { url: 'URL' }
+    patterns = [r'"ajax"\s*:\s*"([^"]+)"', r"ajax\s*:\s*\{\s*url\s*:\s*'([^']+)'",
+                r"ajax\s*:\s*'([^']+)'", r'ajax\s*:\s*\{\s*url\s*:\s*\"([^\"]+)\"']
+    for p in patterns:
+        m = re.search(p, html)
+        if m:
+            url = m.group(1)
+            if url.startswith('http'):
+                return url
+            # relative -> join with base
+            from urllib.parse import urljoin
+            return urljoin(base_url, url)
+    return None
 
 
 def api_scrape(ajax_url, start_page, end_page, csv_checkpoint, cookies=None, headers=None, page_length=10):
@@ -230,7 +311,69 @@ def api_scrape(ajax_url, start_page, end_page, csv_checkpoint, cookies=None, hea
 
     return total_rows
 
-def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=True, driver_path=None, start_page=None, no_headless=False, debug=False):
+
+def api_get_page(ajax_url, page, cookies=None, headers=None, page_length=10):
+    """Return the raw data array for a given 1-based page from the DataTables ajax endpoint."""
+    s = requests.Session()
+    if headers:
+        s.headers.update(headers)
+    if cookies:
+        for c in cookies:
+            s.cookies.set(c['name'], c.get('value',''))
+
+    start = (page - 1) * page_length
+    params = {'start': start, 'length': page_length, 'draw': page}
+    resp = s.get(ajax_url, params=params, timeout=30)
+    resp.raise_for_status()
+    j = resp.json()
+    if isinstance(j, dict):
+        return j.get('data') or j.get('aaData') or []
+    if isinstance(j, list):
+        return j
+    return []
+
+
+def find_resume_page_via_api(last_identifier, ajax_url, est_page, cookies=None, headers=None, page_length=10, id_index=4, max_scan=50):
+    """Scan nearby pages (starting at est_page) to find the page that contains last_identifier.
+    Returns the page number that contains it, or est_page if not found.
+    id_index: column index in returned row data that contains the unique identifier (NAFDAC Reg No)
+    max_scan: how many pages to scan forward/backward before giving up
+    """
+    try:
+        # First check estimated page
+        pages_to_check = [est_page]
+        # then expand forwards and backwards alternately
+        for i in range(1, max_scan+1):
+            pages_to_check.append(est_page + i)
+            if est_page - i > 0:
+                pages_to_check.append(est_page - i)
+
+        checked = set()
+        for p in pages_to_check:
+            if p in checked or p < 1:
+                continue
+            checked.add(p)
+            try:
+                rows = api_get_page(ajax_url, p, cookies=cookies, headers=headers, page_length=page_length)
+            except Exception:
+                continue
+            for r in rows:
+                # try to get identifier
+                try:
+                    if isinstance(r, dict):
+                        vals = list(r.values())
+                    else:
+                        vals = list(r)
+                    ident = vals[id_index] if len(vals) > id_index else None
+                    if ident and str(ident).strip() == str(last_identifier).strip():
+                        return p
+                except Exception:
+                    continue
+        return est_page
+    except Exception:
+        return est_page
+
+def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=True, driver_path=None, start_page=None, no_headless=False, debug=False, force_api=False, csv_only=False):
     # Setup Chrome options
     options = webdriver.ChromeOptions()
     if not no_headless:
@@ -254,6 +397,40 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
                 print(f"Driver init failed (attempt {attempt+1}/3): {e}")
                 time.sleep(2)
         raise Exception(f"Could not initialize Chrome driver: {last_err}")
+
+    # If user requested force-api, try to detect the AJAX endpoint from the HTML and run the API scraper
+    # without initializing Selenium (this avoids webdriver_manager probing the local browser).
+    if force_api:
+        try:
+            csv_checkpoint = os.path.splitext(output_file)[0] + ".csv"
+            # Determine start page from existing checkpoint or provided start_page
+            data, last_page = load_existing_data(output_file)
+            if start_page:
+                page = int(start_page)
+            else:
+                page = last_page if resume else 1
+            print(f"(force-api) starting from page {page}")
+
+            main_html = None
+            try:
+                main_html = requests.get('https://greenbook.nafdac.gov.ng/', timeout=20).text
+            except Exception as rexc:
+                print(f"Failed to fetch main page for force-api detection: {rexc}")
+
+            force_ajax = None
+            if main_html:
+                force_ajax = detect_ajax_from_html(main_html, base_url='https://greenbook.nafdac.gov.ng/')
+
+            if force_ajax:
+                print(f"Force-API detected ajax endpoint from HTML: {force_ajax}")
+                headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://greenbook.nafdac.gov.ng/'}
+                scraped = api_scrape(force_ajax, page, end_page, csv_checkpoint, headers=headers)
+                print(f"Force-API scraping finished, {scraped} rows appended to {csv_checkpoint}")
+                return
+            else:
+                print("--force-api requested but could not detect ajax endpoint from HTML; falling back to Selenium")
+        except Exception as e:
+            print(f"Force-API early path failed: {e}; continuing with Selenium")
 
     # Initialize driver
     driver = init_driver()
@@ -306,6 +483,34 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
                 return
         except Exception as e:
             print(f"API detection/scrape skipped due to error: {e}")
+
+        # If user requested force-api, attempt to detect AJAX endpoint from HTML and run api_scrape without Selenium
+        if force_api:
+            try:
+                main_html = None
+                try:
+                    main_html = requests.get('https://greenbook.nafdac.gov.ng/', timeout=20).text
+                except Exception as rexc:
+                    print(f"Failed to fetch main page for API-detection: {rexc}")
+
+                force_ajax = None
+                if main_html:
+                    force_ajax = detect_ajax_from_html(main_html, base_url='https://greenbook.nafdac.gov.ng/')
+
+                if force_ajax:
+                    print(f"Force-API detected ajax endpoint: {force_ajax}")
+                    csv_checkpoint = os.path.splitext(output_file)[0] + ".csv"
+                    scraped = api_scrape(force_ajax, page, end_page, csv_checkpoint, headers={'User-Agent':'Mozilla/5.0','Referer':'https://greenbook.nafdac.gov.ng/'})
+                    print(f"Force-API scraping finished, {scraped} rows appended to {csv_checkpoint}")
+                    try:
+                        driver.quit()
+                    except:
+                        pass
+                    return
+                else:
+                    print("--force-api requested but could not detect ajax endpoint from HTML; continuing with Selenium")
+            except Exception as e:
+                print(f"Force-API path failed: {e}")
         
         # Load existing data and determine start page
         data, last_page = load_existing_data(output_file)
@@ -315,6 +520,115 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
         else:
             page = last_page if resume else 1
         print(f"Starting from page {page}")
+
+        # If we have existing data, try to locate the exact page that contains the last row
+        # so we can resume from the next page instead of re-scraping pages or starting at 1.
+        if data:
+            last_row = data[-1]
+            last_identifier = None
+            try:
+                # Prefer NAFDAC Reg No column if present (index 4)
+                if len(last_row) > 4:
+                    last_identifier = last_row[4]
+                else:
+                    # fallback to last column
+                    last_identifier = last_row[-1]
+            except Exception:
+                last_identifier = None
+
+            if last_identifier:
+                print(f"Last scraped identifier from checkpoint: {last_identifier}")
+                # Try to detect ajax endpoint for fast lookup
+                try:
+                    ajax_url2, dt_info2 = detect_datatables_ajax(driver)
+                except Exception:
+                    ajax_url2, dt_info2 = (None, None)
+
+                if ajax_url2:
+                    try:
+                        est = page
+                        found_page = find_resume_page_via_api(last_identifier, ajax_url2, est_page=est, cookies=driver.get_cookies(), headers={'User-Agent':'Mozilla/5.0','Referer':driver.current_url}, page_length=(dt_info2.get('length',10) if dt_info2 else 10))
+                        if found_page:
+                            # resume from the page after the one containing last_identifier
+                            page = found_page + 1
+                            print(f"Detected last identifier on page {found_page} via API — resuming from {page}")
+                    except Exception as e:
+                        print(f"API resume detection failed: {e}")
+                elif force_api:
+                    # Attempt HTML detection if user explicitly requested force-api
+                    try:
+                        main_html = requests.get('https://greenbook.nafdac.gov.ng/', timeout=20).text
+                        force_ajax2 = detect_ajax_from_html(main_html, base_url='https://greenbook.nafdac.gov.ng/')
+                        if force_ajax2:
+                            est = page
+                            found_page = find_resume_page_via_api(last_identifier, force_ajax2, est_page=est, headers={'User-Agent':'Mozilla/5.0','Referer':'https://greenbook.nafdac.gov.ng/'}, page_length=10)
+                            page = found_page + 1
+                            print(f"Detected last identifier on page {found_page} via forced-API HTML detection — resuming from {page}")
+                    except Exception as e:
+                        print(f"Force-API resume detection failed: {e}")
+                else:
+                    # Fall back to a Selenium-based localized search: jump to estimated page and verify
+                    try:
+                        est = page
+                        print(f"Attempting to verify last scraped identifier via Selenium starting at est page {est}")
+                        # Try to jump to estimated page
+                        try:
+                            if est > 1:
+                                # Attempt a direct DataTables JS jump (0-based index)
+                                js_jump = ("(function(){var tblEl = document.querySelector('table.dataTable'); if(!tblEl) return 'no-table'; var dt=null; try{ dt = $(tblEl).DataTable(); }catch(e){} if(!dt){ try{ dt = $.fn.dataTable.Api(tblEl); }catch(e){} } if(!dt) return 'no-dt'; try{ dt.page(%d).draw(false); return 'ok'; }catch(e){ return 'err'; }})();") % (est - 1)
+                                try:
+                                    driver.execute_script(js_jump)
+                                except Exception:
+                                    pass
+                                time.sleep(1)
+                        except Exception:
+                            pass
+
+                        def page_contains_identifier(idval):
+                            try:
+                                rows = driver.find_elements(By.CSS_SELECTOR, "table.dataTable tbody tr")
+                                for r in rows:
+                                    try:
+                                        cells = r.find_elements(By.TAG_NAME, 'td')
+                                        vals = [c.text.strip() for c in cells]
+                                        if len(vals) > 4 and vals[4].strip() == str(idval).strip():
+                                            return True
+                                    except Exception:
+                                        continue
+                            except Exception:
+                                return False
+                            return False
+
+                        found = False
+                        if page_contains_identifier(last_identifier):
+                            found = True
+                            found_page = est
+                        else:
+                            # scan a few pages forward (server-side ordering is stable)
+                            for offset in range(1, 6):
+                                try:
+                                    target = est + offset
+                                    # Try DataTables JS jump to target
+                                    js_jump2 = ("(function(){var tblEl = document.querySelector('table.dataTable'); if(!tblEl) return 'no-table'; var dt=null; try{ dt = $(tblEl).DataTable(); }catch(e){} if(!dt){ try{ dt = $.fn.dataTable.Api(tblEl); }catch(e){} } if(!dt) return 'no-dt'; try{ dt.page(%d).draw(false); return 'ok'; }catch(e){ return 'err'; }})();") % (target - 1)
+                                    try:
+                                        driver.execute_script(js_jump2)
+                                    except Exception:
+                                        pass
+                                    time.sleep(1)
+                                    if page_contains_identifier(last_identifier):
+                                        found = True
+                                        found_page = target
+                                        break
+                                except Exception:
+                                    break
+
+                        if found:
+                            page = found_page + 1
+                            print(f"Found last identifier on page {found_page} via Selenium — resuming from {page}")
+                        else:
+                            print("Could not locate exact last identifier via Selenium — falling back to estimated page")
+                    except Exception as e:
+                        print(f"Selenium resume detection failed: {e}")
         
         # Navigate to start page
         if page > 1:
@@ -690,6 +1004,10 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
                 # If failures exceed threshold, skip this page
                 if fail_count >= 3:
                     print(f"Page {page} failing repeatedly — skipping to next page")
+                    try:
+                        log_skipped_page(page, str(e))
+                    except Exception:
+                        pass
                     # Try to jump to the next page using DataTables API; fallback to clicking next
                     try:
                         if go_to_page(page + 1):
@@ -797,9 +1115,21 @@ def scrape_greenbook(output_file="nafdac_greenbook.xlsx", end_page=876, resume=T
                         print("Max retries reached, stopping scrape")
                         return
         
-        # Save final data to Excel
-        print(f"Saving {len(data)} records to {output_file}")
-        save_to_excel(data, output_file)
+        # Save final data to Excel (convert checkpoint CSV to Excel using streaming if available)
+        csv_checkpoint = os.path.splitext(output_file)[0] + ".csv"
+        if csv_only:
+            print(f"--csv-only set: leaving CSV checkpoint in place at {csv_checkpoint} and skipping Excel conversion.")
+        else:
+            if os.path.exists(csv_checkpoint):
+                print(f"Converting checkpoint CSV to Excel: {csv_checkpoint} -> {output_file}")
+                try:
+                    csv_to_excel_stream(csv_checkpoint, output_file)
+                except Exception as e:
+                    print(f"Failed to convert CSV to Excel: {e}. Falling back to in-memory save.")
+                    save_to_excel(data, output_file)
+            else:
+                print(f"Saving {len(data)} records to {output_file}")
+                save_to_excel(data, output_file)
         
         print("Scraping completed successfully")
         
@@ -816,7 +1146,38 @@ if __name__ == "__main__":
     parser.add_argument("--file", type=str, default="nafdac_greenbook.xlsx", help="Output Excel file path")
     parser.add_argument("--no-headless", action="store_true", help="Run Chrome with visible UI for debugging")
     parser.add_argument("--debug", action="store_true", help="Enable debug JS dumps to stdout")
+    parser.add_argument("--force-api", action="store_true", help="Run using HTTP API only (no Selenium) if possible")
+    parser.add_argument("--csv-only", action="store_true", help="Only write/appends to CSV checkpoint and skip Excel conversion")
     args = parser.parse_args()
 
-    # If user provided a start page, pass it through to scrape_greenbook
-    scrape_greenbook(output_file=args.file, end_page=args.end, resume=True, driver_path=args.driver, start_page=args.start, no_headless=args.no_headless, debug=args.debug)
+    # Determine start page precedence: CLI arg > START_PAGE env var > start_page.txt file > existing checkpoint
+    default_start = None
+    # CLI will override; but if not provided, check env/file
+    env_val = os.environ.get('START_PAGE')
+    if env_val:
+        try:
+            default_start = int(env_val)
+            print(f"Using START_PAGE from environment: {default_start}")
+        except Exception:
+            default_start = None
+    # start_page.txt takes next precedence
+    if default_start is None and os.path.exists('start_page.txt'):
+        try:
+            with open('start_page.txt', 'r', encoding='utf-8') as f:
+                txt = f.read().strip()
+                default_start = int(txt)
+                print(f"Using start_page from start_page.txt: {default_start}")
+        except Exception:
+            default_start = None
+
+    # If still not provided, try to compute from existing CSV/XLSX checkpoints
+    if default_start is None:
+        computed = compute_start_page_from_files()
+        if computed:
+            default_start = computed
+            print(f"Detected existing checkpoint; computed start page: {default_start}")
+
+    start_arg = args.start if args.start is not None else default_start
+
+    # Call scraper with csv_only flag
+    scrape_greenbook(output_file=args.file, end_page=args.end, resume=True, driver_path=args.driver, start_page=start_arg, no_headless=args.no_headless, debug=args.debug, force_api=args.force_api, csv_only=args.csv_only)
