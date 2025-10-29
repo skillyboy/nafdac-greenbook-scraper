@@ -12,6 +12,7 @@ import os
 Workbook = None
 
 
+
 def compute_max_widths(csv_path, encoding='utf-8'):
     max_widths = []
     with open(csv_path, newline='', encoding=encoding) as f:
