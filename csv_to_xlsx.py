@@ -28,6 +28,7 @@ def compute_max_widths(csv_path, encoding='utf-8'):
     return max_widths
 
 
+
 def csv_to_xlsx(csv_path, xlsx_path, encoding='utf-8'):
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV file not found: {csv_path}")

@@ -19,7 +19,7 @@ import time
 
 # Pre-run convenience: allow setting a start page via environment variable or a small file
 # Priority: CLI --start > START_PAGE env var > start_page.txt file > existing checkpoint detection
-def compute_start_page_from_files(base_name="nafdac_greenbook"):
+def compute_start_page_from_files(base_name="nafdac_greenbook_1400"):
     """Return an estimated start page based on existing CSV or Excel checkpoint files.
     Returns None if no checkpoint is present.
     """
